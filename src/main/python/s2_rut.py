@@ -7,12 +7,17 @@ Created on Wed Jan 20 13:48:33 2016
 import snappy
 import s2_rut_algo
 import numpy as np
+import math
 import datetime
 import s2_l1_rad_conf as rad_conf
 
 SUN_AZIMUTH_BAND_NAME = "sun_azimuth"
 S2_MSI_TYPE_STRING = 'S2_MSI_Level-1C'
 
+jpy = snappy.jpy
+
+P2D_Double = jpy.get_type('java.awt.geom.Point2D$Double')
+DirectPosition2D = jpy.get_type('org.geotools.geometry.DirectPosition2D')
 
 class S2RutOp:
     def __init__(self):
@@ -31,7 +36,8 @@ class S2RutOp:
         if self.source_product.getProductType() != S2_MSI_TYPE_STRING:
             raise RuntimeError('Source product must be of type "' + S2_MSI_TYPE_STRING + '"')
 
-        self.product_meta, self.datastrip_meta = self.source_product.getMetadataRoot().getElements()
+        self.product_meta = self.source_product.getMetadataRoot().getElements()[0]
+        self.datastrip_meta = self.source_product.getMetadataRoot().getElements()[1]
 
         self.toa_band_names = context.getParameter('band_names')
 
@@ -59,8 +65,8 @@ class S2RutOp:
 
         context.setTargetProduct(rut_product)
 
-    def computeTile(self, context, target_band, tile):
-        source_band = self.target_source_map[target_band]
+    def computeTile(self, context, band, tile):
+        source_band = self.target_source_map[band]
         toa_band_id = source_band.getSpectralBandIndex() - 1
         self.rut_algo.a = self.get_a(self.datastrip_meta, toa_band_id)
         self.rut_algo.e_sun = self.get_e_sun(self.product_meta, toa_band_id)
@@ -68,10 +74,36 @@ class S2RutOp:
         self.rut_algo.beta = self.get_beta(self.datastrip_meta, toa_band_id)
         self.rut_algo.u_diff_temp = self.get_u_diff_temp(self.datastrip_meta, toa_band_id)
 
-        toa_tile = context.getSourceTile(source_band, tile.getRectangle())
+        target_rectangle = tile.getRectangle()
+        toa_tile = context.getSourceTile(source_band, target_rectangle)
         toa_samples = toa_tile.getSamplesInt()
-        sun_azimuth_tile = context.getSourceTile(self.source_product.getBand(SUN_AZIMUTH_BAND_NAME), tile.getRectangle())
-        sun_azimuth_samples = sun_azimuth_tile.getSamplesFloat()
+
+        sun_azimuth_band = self.source_product.getBand(SUN_AZIMUTH_BAND_NAME)
+        sun_azimuth_samples = np.empty(target_rectangle.width * target_rectangle.height)
+        if sun_azimuth_band.getRasterWidth() != band.getRasterWidth() or sun_azimuth_band.getRasterHeight() != band.getRasterHeight():
+            sampleIndex = 0
+            i2m = band.getImageToModelTransform()
+            m2s = band.getModelToSceneTransform()
+            s2m = sun_azimuth_band.getSceneToModelTransform()
+            m2i = sun_azimuth_band.getImageToModelTransform().createInverse()
+            print("Using transform!!!!!!!!!!!!!!")
+            for y in range(target_rectangle.y, target_rectangle.y + target_rectangle.height):
+                for x in range(target_rectangle.x, target_rectangle.x + target_rectangle.width):
+                    source_imageP = P2D_Double(x + 0.5, y + 0.5)
+                    source_modelP = i2m.transform(source_imageP, P2D_Double())
+                    source_sceneP = m2s.transform(source_modelP, P2D_Double())
+                    target_modelP = s2m.transform(source_sceneP, P2D_Double())
+                    target_imageP = m2i.transform(target_modelP)
+                    target_imageX = math.floor(target_imageP.getX())
+                    target_imageY = math.floor(target_imageP.getY())
+                    sun_azimuth_samples[sampleIndex] = sun_azimuth_band.getSampleFloat(target_imageX, target_imageY)
+                    sampleIndex += 1
+
+                    # sun_azimuth_samples = self.get_sun_azimuth_samples_with_JAI(sun_azimuth_band, target_band, target_rectangle)
+        else:
+            print("Using tile direct!!!!!!!!!!!!!!")
+            sun_azimuth_tile = context.getSourceTile(sun_azimuth_band, target_rectangle)
+            sun_azimuth_samples = sun_azimuth_tile.getSamplesFloat()
 
         # this is the core where the uncertainty calculation should grow
         unc = self.rut_algo.unc_calculation(toa_band_id, np.array(toa_samples, dtype=np.uint16),
@@ -138,3 +170,27 @@ class S2RutOp:
                  context.getParameter('Gamma_knowledge'), context.getParameter('Diffuser-absolute_knowledge'),
                  context.getParameter('Diffuser-temporal_knowledge'), context.getParameter('Diffuser-cosine_effect'),
                  context.getParameter('Diffuser-straylight_residual'), context.getParameter('L1C_image_quantisation')])
+
+    # needs:
+    # jpy = snappy.jpy
+    #
+    # Resample = jpy.get_type('org.esa.snap.core.gpf.common.resample.Resample')
+    # JAI = jpy.get_type('javax.media.jai.JAI')
+    # Interpolation = jpy.get_type('javax.media.jai.Interpolation')
+    #
+    # but neither JAI nor Interpolation can be loaded
+    # def get_sun_azimuth_samples_with_JAI(self, sun_azimuth_band, target_band, target_rectangle):
+    #     interpolation = Interpolation.getInstance(Interpolation.INTERP_NEAREST)
+    #     resampled_sun_azimuth_image = Resample.createInterpolatedMultiLevelImage(sun_azimuth_band.getGeophysicalImage(),
+    #                                                                              sun_azimuth_band.getNoDataValue(),
+    #                                                                              sun_azimuth_band.getImageToModelTransform(),
+    #                                                                              target_band.getRasterWidth(),
+    #                                                                              target_band.getRasterHeight(),
+    #                                                                              target_band.getMultiLevelModel(),
+    #                                                                              interpolation)
+    #     sun_azimuth_samples = np.empty(target_rectangle.width * target_rectangle.height, dtype=np.float32)
+    #     resampled_sun_azimuth_image.getData(target_rectangle).getSamples(target_rectangle.x, target_rectangle.y,
+    #                                                                      target_rectangle.width,
+    #                                                                      target_rectangle.height,
+    #                                                                      sun_azimuth_samples)
+    #     return sun_azimuth_samples
